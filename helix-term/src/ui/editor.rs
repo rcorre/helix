@@ -824,7 +824,7 @@ impl EditorView {
                 }
                 (Mode::Insert, Mode::Normal) => {
                     // if exiting insert mode, remove completion
-                    self.completion = None;
+                    self.clear_completion(cxt.editor);
 
                     // TODO: Use an on_mode_change hook to remove signature help
                     cxt.jobs.callback(async {
@@ -962,9 +962,6 @@ impl EditorView {
             return;
         }
 
-        // Immediately initialize a savepoint
-        doc_mut!(editor).savepoint();
-
         editor.last_completion = None;
         self.last_insert.1.push(InsertEvent::TriggerCompletion);
 
@@ -983,20 +980,20 @@ impl EditorView {
     }
 
     pub fn handle_idle_timeout(&mut self, cx: &mut commands::Context) -> EventResult {
-        if let Some(completion) = &mut self.completion {
-            return if completion.ensure_item_resolved(cx) {
-                EventResult::Consumed(None)
-            } else {
-                EventResult::Ignored(None)
-            };
-        }
-
-        if cx.editor.mode != Mode::Insert || !cx.editor.config().auto_completion {
+        let config = cx.editor.config();
+        if cx.editor.mode != Mode::Insert || !config.auto_completion {
             return EventResult::Ignored(None);
         }
 
-        crate::commands::insert::idle_completion(cx);
-
+        self.clear_completion(cx.editor);
+        commands::completion(&mut commands::Context {
+            register: None,
+            editor: cx.editor,
+            jobs: cx.jobs,
+            count: None,
+            callback: None,
+            on_next_key_callback: None,
+        });
         EventResult::Consumed(None)
     }
 }
@@ -1226,7 +1223,7 @@ impl Component for EditorView {
                 EventResult::Consumed(None)
             }
             Event::Key(mut key) => {
-                cx.editor.reset_idle_timer();
+                cx.editor.clear_idle_timer();
                 canonicalize_key(&mut key);
 
                 // clear status
@@ -1278,7 +1275,8 @@ impl Component for EditorView {
                                 if let Some(completion) = &mut self.completion {
                                     completion.update(&mut cx);
                                     if completion.is_empty() {
-                                        self.clear_completion(cx.editor);
+                                        self.completion = None;
+                                        doc_mut!(cx.editor).savepoint = None;
                                     }
                                 }
                             }

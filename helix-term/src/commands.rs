@@ -3132,18 +3132,11 @@ pub mod insert {
         super::completion(cx);
     }
 
-    fn language_server_completion(cx: &mut Context, ch: char) {
-        let config = cx.editor.config();
-        if !config.auto_completion {
-            return;
-        }
-
+    pub fn is_server_trigger_char(doc: &Document, ch: char) -> bool {
         use helix_lsp::lsp;
-        // if ch matches completion char, trigger completion
-        let doc = doc_mut!(cx.editor);
         let language_server = match doc.language_server() {
             Some(language_server) => language_server,
-            None => return,
+            None => return false,
         };
 
         let capabilities = language_server.capabilities();
@@ -3153,11 +3146,35 @@ pub mod insert {
             ..
         }) = &capabilities.completion_provider
         {
-            // TODO: what if trigger is multiple chars long
-            if triggers.iter().any(|trigger| trigger.contains(ch)) {
-                cx.editor.clear_idle_timer();
-                super::completion(cx);
+            triggers.iter().any(|trigger| trigger.contains(ch))
+        } else {
+            false
+        }
+    }
+
+    fn language_server_completion(cx: &mut Context, ch: char) {
+        use helix_core::chars::char_is_word;
+
+        let config = cx.editor.config();
+        if !config.auto_completion {
+            return;
+        }
+        let (view, doc) = current_ref!(cx.editor);
+        if char_is_word(ch) && doc.savepoint.is_none() {
+            let text = doc.text().slice(..);
+            let cursor = doc.selection(view.id).primary().cursor(text);
+            let mut iter = text.chars_at(cursor);
+            iter.reverse();
+            for _ in 0..config.completion_trigger_len {
+                if iter.next().map_or(true, |c| !char_is_word(c)) {
+                    return;
+                }
             }
+            cx.editor.reset_idle_timer();
+            return;
+        }
+        if is_server_trigger_char(doc, ch) {
+            cx.editor.reset_idle_timer_zero();
         }
     }
 
@@ -4172,6 +4189,13 @@ pub fn completion(cx: &mut Context) {
         Some(future) => future,
         None => return,
     };
+    let future = async move {
+        match future.await {
+            Ok(v) => Ok(v),
+            Err(helix_lsp::Error::Timeout) => Ok(serde_json::Value::Null),
+            Err(e) => Err(e),
+        }
+    };
 
     let trigger_offset = cursor;
 
@@ -4184,11 +4208,21 @@ pub fn completion(cx: &mut Context) {
     let offset = iter.take_while(|ch| chars::char_is_word(*ch)).count();
     let start_offset = cursor.saturating_sub(offset);
 
+    doc.savepoint();
+    let trigger_version = doc.version();
     cx.callback(
         future,
         move |editor, compositor, response: Option<lsp::CompletionResponse>| {
+            let doc = doc_mut!(editor);
+            let savepoint = match doc.savepoint.take() {
+                Some(s) => s,
+                None => return,
+            };
             if editor.mode != Mode::Insert {
-                // we're not in insert mode anymore
+                return;
+            }
+            if savepoint.0 != trigger_version {
+                doc.savepoint = Some(savepoint);
                 return;
             }
 
@@ -4199,13 +4233,20 @@ pub fn completion(cx: &mut Context) {
                     is_incomplete: _is_incomplete,
                     items,
                 })) => items,
-                None => Vec::new(),
+                None => {
+                    editor.set_status(
+                        "The completion response is none and will request server again",
+                    );
+                    editor.reset_idle_timer();
+                    return;
+                }
             };
 
             if items.is_empty() {
-                // editor.set_error("No completion available");
+                // editor.set_error("No completion available".to_string());
                 return;
             }
+            doc.savepoint = Some(savepoint);
             let size = compositor.size();
             let ui = compositor.find::<ui::EditorView>().unwrap();
             ui.set_completion(
